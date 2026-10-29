@@ -1,0 +1,31 @@
+# Builds recomp_launcher.exe on every push, and attaches it to a GitHub release when a v* tag is pushed,
+# so a fresh game clone can download the launcher for its first-time setup.
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -A x64
+          cmake --build build --config Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recomp_launcher
+          path: build/Release/recomp_launcher.exe
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" build/Release/recomp_launcher.exe --title "${{ github.ref_name }}" --generate-notes

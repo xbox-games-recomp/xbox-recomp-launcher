@@ -8,6 +8,30 @@ arguments, redirecting its output to a log file.
 One launcher serves every game. Everything game specific lives in a `launcher.ini` manifest in the game's
 repository; the launcher is a single dependency-free Win32 executable (C++17, no runtime DLLs).
 
+It also does the **first-time setup**. A recompilation ships no game content, so a fresh clone has nothing to
+run. On the **Setup** page the player points the launcher at their own disc image (or an already extracted
+disc). The launcher checks that the build tools are installed, extracts the disc, checks that it is the
+expected version, and runs the game's recompile and build steps, showing their output as they run. Play is
+available once setup has finished.
+
+## First run from a fresh clone
+
+The launcher is normally built together with the game. Before the first build, get it one of two ways:
+
+- Download `recomp_launcher.exe` from this repository's
+  [releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the game's repository root.
+- Or build it from the game's `launcher` submodule, which takes a few seconds:
+
+  ```
+  cmake -S launcher -B launcher/build
+  cmake --build launcher/build --config Release
+  ```
+
+  The exe ends up in `launcheruild\Release\`. It finds the game's `launcher.ini` in a parent folder.
+
+Run it, choose the disc on the Setup page and press **Run setup**. The game's own build then puts a copy named
+after the game (e.g. `mm3_launcher.exe`) in the repository root, and from then on that copy is the one to use.
+
 ## Using it from a game repository
 
 Add this repository as a submodule and hook it into the game's CMake build:
@@ -35,6 +59,8 @@ Then write a `launcher.ini` in the repository root and add `launcher.user.ini` t
 | `launcher.exe --play` | Launch straight away with the saved settings, no window |
 | `launcher.exe --manifest <path>` | Use this manifest instead of searching for one |
 | `launcher.exe ... -- <args>` | Extra arguments for the game |
+
+`--play` opens the window on the Setup page instead when the game is not set up yet.
 
 Without `--manifest`, the launcher looks for `launcher.ini` in its own directory, then in each parent directory,
 so the same exe works from the build directory or the repository root.
@@ -107,6 +133,62 @@ the environment the game inherits (so a stray global variable cannot change the 
 
 If the "Extra arguments" box already contains a setting's argument (the text of `arg=` up to its `=`), the
 setting is not passed, since some runtimes (ReXGlue) exit when a cvar is given twice.
+
+## First-time setup (`[setup]`, `[check.*]`, `[step.*]`)
+
+A manifest with a `[setup]` section (or any `[step.*]`) gets a **Setup** page. Setup counts as needed while any
+`done_when` path is missing. In that state the window opens on the Setup page and Play sends the player there.
+
+```ini
+[setup]
+; Where the game copy goes. The player chooses either:
+;  - a disc image (.iso): extracted into game_dir. Plain XISO, or a full XGD1/XGD2/XGD3 dump.
+;  - a folder that holds the extracted disc: game_dir becomes a directory junction to it (nothing is copied).
+; Leave game_dir out when the game needs no files.
+game_dir=game_files
+; A file every good copy has, relative to game_dir.
+game_check=default.xbe
+; Optional. A mismatch warns that the copy is a different version and asks whether to go on.
+game_sha1=e63b03dd956544d3838bead8be5622da6cd189e1
+; Shown under the game copy box.
+game_label=Your Midtown Madness 3 disc
+; Shown at the top of the page.
+intro=The launcher builds the game from your own copy...
+; Paths separated by |. Default: [game] exe, every [require] path, and game_dir\game_check.
+done_when=
+; Everything setup prints, beside the manifest (default shown).
+log=setup.log
+
+; Required tools, checked first. A check passes when any exists= path exists (separated by |) or command= exits 0.
+[check.python]
+label=Python 3.10+ with capstone
+command=python -c "import capstone"
+hint=Install Python from https://www.python.org, then run: pip install capstone
+
+; Build steps, run in order through cmd.exe with their output in the window and the log.
+[step.build]
+label=Recompile and build the game
+command=%SystemRoot%\System32\WindowsPowerShell1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File regen.ps1
+; Default {root}.
+workdir={root}
+; Skip the step when this path exists.
+skip_if=build\Release\mm3_recomp.exe
+; Optional. The step fails unless its output contains this text (for scripts that exit 0 on failure).
+success=BUILD_EXIT=0
+```
+
+A step fails on a non-zero exit code, or when `success=` text is set and its output does not contain it.
+Setup stops at the first failure, and pressing Run setup again picks it up at the first step without a
+`skip_if` match.
+
+Commands run with `PYTHONUNBUFFERED=1` and `MSBUILDDISABLENODEREUSE=1`, and with the Windows folders added to
+`PATH` if the inherited `PATH` lacks them. **Cancel** kills the step and everything it started.
+
+Write the steps so that they can run more than once. The player may run setup again after a failure or after
+updating the repository.
+
+The build usually overwrites the launcher's copies with fresh builds. A copy that is running, such as the one
+that started the build, is left as it is (see `cmake/copy_launcher.cmake`).
 
 ## The Launcher page
 
