@@ -1,7 +1,7 @@
 # recomp-launcher
 
 A small settings window and launcher for statically recompiled Xbox / Xbox 360 games. It replaces the
-per-game `run_*.bat` / `play.bat` scripts: the player picks graphics, input and logging options in a window,
+per-game launch batch files: the player picks graphics, input and logging options in a window,
 presses **Play**, and the launcher starts the game with the matching environment variables and command-line
 arguments, redirecting its output to a log file.
 
