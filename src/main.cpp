@@ -14,8 +14,12 @@
 #ifndef _UNICODE
 #define _UNICODE
 #endif
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
@@ -650,7 +654,10 @@ void set_status(const wstring& s) { SetWindowTextW(app.status, s.c_str()); }
 void refresh_status() {
   if (app.running) return;
   wstring exe = join(app.g.root, substitute(app.g, app.g.exe));
-  set_status(file_exists(exe) ? L"Ready" : L"Not built: " + exe);
+  bool built = file_exists(exe);
+  set_status(built ? L"Ready" : L"Not built: " + exe);
+  // The console option means nothing for a GUI-subsystem game.
+  EnableWindow(app.show_console, !built || is_console_exe(exe));
 }
 
 void layout() {
@@ -813,7 +820,7 @@ void create_controls() {
   app.rows.push_back({lp, l2, app.extra_env, h2});
   app.show_console = child(WC_BUTTONW, L"Show the game's console window", WS_TABSTOP | BS_AUTOCHECKBOX,
                            IDC_SHOW_CONSOLE);
-  HWND h3 = child(WC_STATICW, L"Console programs only. Logged streams go to the log file either way.",
+  HWND h3 = child(WC_STATICW, L"Console-subsystem games only. Logged streams go to the log file either way.",
                   SS_NOPREFIX, 0);
   app.rows.push_back({lp, nullptr, app.show_console, h3});
   app.close_on_launch = child(WC_BUTTONW, L"Close the launcher when the game starts", WS_TABSTOP | BS_AUTOCHECKBOX,
