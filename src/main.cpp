@@ -192,6 +192,7 @@ struct Setting {
 // First-time setup: bring in the player's game copy, check the tools, then run the build steps.
 struct Check {
   wstring label, exists, command, hint;
+  wstring install;  // command that installs the tool (winget), offered when it is missing
 };
 
 struct Step {
@@ -323,6 +324,7 @@ bool load_manifest(Game& g, const wstring& path, wstring& err) {
       c.exists = ini_get(m, sec, L"exists");
       c.command = ini_get(m, sec, L"command");
       c.hint = ini_get(m, sec, L"hint");
+      c.install = ini_get(m, sec, L"install");
       su.checks.push_back(c);
     }
     if (l.rfind(L"step.", 0) == 0) {
@@ -932,6 +934,34 @@ wstring gb(uint64_t bytes) {
   return b;
 }
 
+wstring registry_path(HKEY root, const wchar_t* key) {
+  DWORD size = 0;
+  const DWORD flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+  if (RegGetValueW(root, key, L"Path", flags, nullptr, nullptr, &size) != ERROR_SUCCESS || !size) return L"";
+  wstring v(size / sizeof(wchar_t), L'\0');
+  if (RegGetValueW(root, key, L"Path", flags, nullptr, v.data(), &size) != ERROR_SUCCESS) return L"";
+  v.resize(wcslen(v.c_str()));
+  return expand_env(v);
+}
+
+// Installers add themselves to the PATH in the registry, which a running process never sees: take the
+// machine and user PATH from there, keeping the entries ours had on top (set by whoever started us).
+void refresh_path() {
+  wstring fresh = registry_path(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment");
+  wstring user = registry_path(HKEY_CURRENT_USER, L"Environment");
+  if (!user.empty()) fresh += (fresh.empty() ? L"" : L";") + user;
+  if (fresh.empty()) return;
+  wstring have = L";" + lower(fresh) + L";";
+  EnvMap env = current_env();
+  for (auto& e : split(env[L"Path"], L';')) {
+    wstring t = trim(e);
+    if (t.empty() || have.find(L";" + lower(t) + L";") != wstring::npos) continue;
+    fresh += L";" + t;
+    have += lower(t) + L";";
+  }
+  SetEnvironmentVariableW(L"Path", fresh.c_str());
+}
+
 // Moves the bar to the current item's fraction f (0..1).
 void sfraction(double f) {
   if (app.prog_total <= 0) return;
@@ -1050,6 +1080,9 @@ long run_command(const wstring& command, const wstring& workdir, const wstring& 
   env[L"PYTHONIOENCODING"] = L"utf-8";
   // MSBuild's reusable worker nodes would outlive the build holding our pipe open.
   env[L"MSBUILDDISABLENODEREUSE"] = L"1";
+  // CMake 4 (what winget installs now) rejects projects declaring a minimum below 3.5, which old
+  // third-party code still does; this lets it configure them anyway. CMake 3 ignores it.
+  if (!env.count(L"CMAKE_POLICY_VERSION_MINIMUM")) env[L"CMAKE_POLICY_VERSION_MINIMUM"] = L"3.5";
   // Some shells hand down a PATH without the Windows folders; the build scripts need where, powershell, etc.
   wstring sys = expand_env(L"%SystemRoot%");
   wstring& path = env[L"Path"];
@@ -1418,16 +1451,49 @@ DWORD WINAPI setup_thread(void* p) {
   // 0: tools
   sstate(0, Running);
   sprogress(L"Checking the required tools");
-  std::vector<const Check*> missing;
-  for (auto& c : su.checks) {
-    if (app.setup_cancel) break;
-    bool found = false;
-    for (auto& path : split(c.exists, L'|'))
-      if (!trim(path).empty() && path_exists(join(g.root, substitute(g, trim(path))))) found = true;
-    wstring out;
-    if (!found && !c.command.empty()) found = run_command(substitute(g, c.command), g.root, L"", nullptr, true, &out) == 0;
-    slog((found ? L"  found    " : L"  MISSING  ") + c.label);
-    if (!found) missing.push_back(&c);
+  auto check_tools = [&] {
+    std::vector<const Check*> missing;
+    for (auto& c : su.checks) {
+      if (app.setup_cancel) break;
+      bool found = false;
+      for (auto& path : split(c.exists, L'|'))
+        if (!trim(path).empty() && path_exists(join(g.root, substitute(g, trim(path))))) found = true;
+      wstring out;
+      if (!found && !c.command.empty()) found = run_command(substitute(g, c.command), g.root, L"", nullptr, true, &out) == 0;
+      slog((found ? L"  found    " : L"  MISSING  ") + c.label);
+      if (!found) missing.push_back(&c);
+    }
+    return missing;
+  };
+  std::vector<const Check*> missing = check_tools();
+
+  // Offer to install what has an install= command (winget), then look again.
+  std::vector<const Check*> installable;
+  for (auto* c : missing)
+    if (!c->install.empty()) installable.push_back(c);
+  if (!installable.empty() && !app.setup_cancel &&
+      run_command(L"winget --version", g.root, L"", nullptr, true) == 0) {
+    wstring list;
+    for (auto* c : installable) list += L"\n    • " + c->label;
+    if (sask(L"These tools are missing:" + list +
+             L"\n\nInstall them now with winget? Windows may ask for permission for each one, and Visual Studio "
+             L"alone can take 20 minutes or more.")) {
+      for (auto* c : installable) {
+        if (app.setup_cancel) break;
+        refresh_path();  // a tool installed just before (Python, for pip) is on the new PATH
+        wstring cmd = substitute(g, c->install);
+        slog(L"");
+        slog(L"== Installing " + c->label);
+        slog(L"> " + cmd);
+        sprogress(L"Installing " + c->label + L"…");
+        long code = run_command(cmd, g.root);
+        slog(L"== Installing " + c->label + L": exit code " + std::to_wstring(code));
+      }
+      refresh_path();
+      slog(L"");
+      slog(L"Checking the tools again:");
+      missing = check_tools();
+    }
   }
   if (!missing.empty()) {
     slog(L"");

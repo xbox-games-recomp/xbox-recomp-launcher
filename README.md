@@ -16,7 +16,11 @@ available once setup has finished.
 
 ## First run from a fresh clone
 
-The launcher is normally built together with the game. Before the first build, get it one of two ways:
+The games' release zips already contain the launcher. Each game repo has a `release.yml` workflow that, on
+a `v*` tag, zips a shallow clone with its submodules and adds `<game>_launcher.exe` at the root.
+
+In a clone, the launcher is normally built together with the game. Before the first build, get it one of two
+ways:
 
 - Download `recomp_launcher.exe` from this repository's
   [releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the game's repository root.
@@ -27,7 +31,7 @@ The launcher is normally built together with the game. Before the first build, g
   cmake --build launcher/build --config Release
   ```
 
-  The exe ends up in `launcheruild\Release\`. It finds the game's `launcher.ini` in a parent folder.
+  The exe ends up in `launcher\build\Release\`. It finds the game's `launcher.ini` in a parent folder.
 
 Run it, choose the disc on the Setup page and press **Run setup**. The game's own build then puts a copy named
 after the game (e.g. `mm3_launcher.exe`) in the repository root, and from then on that copy is the one to use.
@@ -83,7 +87,7 @@ exe=build\Release\mm3_recomp.exe
 ; Default {root}.
 workdir={root}
 ; Always passed. Quote paths yourself.
-args=--game_data_root="{root}ssets"
+args=--game_data_root="{root}\assets"
 ; Redirect stderr / stdout to these files (optional; they may be the same file).
 stderr_log=run.log
 stdout_log=
@@ -164,11 +168,14 @@ log=setup.log
 label=Python 3.10+ with capstone
 command=python -c "import capstone"
 hint=Install Python from https://www.python.org, then run: pip install capstone
+; Optional: a command that installs the tool. When checks with install= fail, the launcher offers to run
+; them (in check order), reloads PATH from the registry before each one and checks again.
+install=python -m pip install capstone
 
 ; Build steps, run in order through cmd.exe with their output in the window and the log.
 [step.build]
 label=Recompile and build the game
-command=%SystemRoot%\System32\WindowsPowerShell1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File regen.ps1
+command=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File regen.ps1
 ; Default {root}.
 workdir={root}
 ; Skip the step when this path exists.
@@ -197,7 +204,8 @@ A step fails on a non-zero exit code, or when `success=` text is set and its out
 Setup stops at the first failure, and pressing Run setup again picks it up at the first step without a
 `skip_if` match.
 
-Commands run with `PYTHONUNBUFFERED=1` and `MSBUILDDISABLENODEREUSE=1`, and with the Windows folders added to
+Commands run with `PYTHONUNBUFFERED=1`, `MSBUILDDISABLENODEREUSE=1` and `CMAKE_POLICY_VERSION_MINIMUM=3.5` (so
+CMake 4 still configures third-party code that declares an older minimum), and with the Windows folders added to
 `PATH` if the inherited `PATH` lacks them. **Cancel** kills the step and everything it started.
 
 Write the steps so that they can run more than once. The player may run setup again after a failure or after
