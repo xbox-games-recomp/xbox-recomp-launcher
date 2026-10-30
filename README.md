@@ -1,5 +1,7 @@
 # xbox-recomp-launcher
 
+![Screenshot](https://github.com/user-attachments/assets/abb20afb-4f63-426c-b29a-e2435d24b527)
+
 The launcher for statically recompiled Xbox and Xbox 360 games. It builds the game from your own disc on
 first run, then starts it with the options you choose. This page is for players; each game's README says
 which disc version it needs and how long the build takes. Adding the launcher to a game? See
