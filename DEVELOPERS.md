@@ -77,8 +77,8 @@ so the same exe works from the build directory or the repository root.
 ## Manifest format (`launcher.ini`)
 
 A Windows INI file (ASCII). Paths are relative to the manifest's directory.
-Values may use `{root}` (the manifest's directory), `{exe_dir}` (the game executable's directory) and
-`%ENVIRONMENT%` variables.
+Values may use `{root}` (the manifest's directory), `{exe_dir}` (the game executable's directory),
+`{documents}` (the user's Documents folder, wherever Windows keeps it) and `%ENVIRONMENT%` variables.
 
 Comments must be on their own line: Windows INI parsing keeps a trailing `; ...` as part of the value.
 
@@ -135,7 +135,7 @@ Types:
 - **choice** — a drop-down list from `choices=`.
 - **int** — a number box clamped to `min=` / `max=`. An empty box means `default=`, or "not set" with
   `allow_empty=1`.
-- **text** — free text.
+- **text** — free text, at most `max_length=` characters when that is set.
 
 A setting whose value is empty is left out: its `arg=` is not passed and its `env=` variable is removed from
 the environment the game inherits (so a stray global variable cannot change the result).
@@ -209,6 +209,10 @@ A step fails on a non-zero exit code, or when `success=` text is set and its out
 Setup stops at the first failure, and pressing Run setup again picks it up at the first step without a
 `skip_if` match.
 
+Once setup is no longer needed, the Setup page shows every item as done and the button reads **Set up
+again…**. That asks for confirmation, then runs every step whether or not its `skip_if` path exists: a full
+rebuild. It leaves `launcher.user.ini` and the save games alone.
+
 Commands run with `PYTHONUNBUFFERED=1`, `MSBUILDDISABLENODEREUSE=1` and `CMAKE_POLICY_VERSION_MINIMUM=3.5` (so
 CMake 4 still configures third-party code that declares an older minimum), and with the Windows folders added to
 `PATH` if the inherited `PATH` lacks them. **Cancel** kills the step and everything it started.
@@ -218,6 +222,40 @@ updating the repository.
 
 The build usually overwrites the launcher's copies with fresh builds. A copy that is running, such as the one
 that started the build, is left as it is (see `cmake/copy_launcher.cmake`).
+
+## Save games (`[saves]`)
+
+A manifest with a `[saves]` section gets a **Saves** page, before the Launcher page. It lists the game's saves
+(name, last saved, size), newest first. The player can rename a save (Rename or F2 edits the name in place)
+or delete one (Delete or the Delete key, after a confirmation; it goes to the Recycle Bin). Both are
+disabled while the game runs, and the list refreshes when the game exits.
+
+```ini
+[saves]
+; xbox: dir is UDATA\<title id>. Each folder in it is a save, named by Name= in its SaveMeta.xbx.
+; xbox360: dir is <user data root>\<xuid>\<title id>. Saves are the folders in 00000001; the display name is
+;          in Headers\00000001\<folder>.header.
+format=xbox
+dir=%LOCALAPPDATA%\xboxrecomp\UDATA\4d53002a
+; Optional: a type=text [setting.*] holding the profile name the game shows (an Xbox 360 gamertag).
+name_setting=user_name
+```
+
+Renaming changes only that name, which is what the game's own save list shows. The folder is the save's
+identity and stays as it is. Deleting an Xbox 360 save also deletes its header.
+
+With `name_setting=`, every save is listed under that setting's value (its default when empty) instead of its
+own title, and Rename changes the setting: it is written to `launcher.user.ini` straight away (on its own,
+not with other unsaved changes) and shows on the setting's page too. Names containing `"` or longer than
+the setting's `max_length=` are refused. Use it when the game names saves after the profile, as Xbox 360
+games do, and the runtime takes the profile name as an argument (PGR4: `--user_name`).
+
+## Which page opens
+
+The window opens on **Setup** while setup is needed. Once the game is built, it opens on the first page after
+Setup until the player has saved their choices (Save, or Play, which saves them), and on **Launcher** after
+that. When setup finishes and the player has not saved any choices yet, the window moves on to the first
+page after Setup.
 
 ## The Launcher page
 
@@ -240,6 +278,9 @@ Choices are saved to `launcher.user.ini` beside the manifest on **Save** and on 
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+The icon is `src/launcher.ico`, drawn by `tools/make_icon.py` (Pillow); the window uses the game's own
+icon instead when the game's executable has one.
 
 Works with MSVC, clang (GNU or MSVC style driver) and MinGW. On other platforms the CMake project does nothing,
 so including it from a cross-platform game is harmless.

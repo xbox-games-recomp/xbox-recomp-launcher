@@ -25,10 +25,12 @@ tools. After that the game starts in seconds.
 4. Press **Run setup**. It checks the build tools and offers to install missing ones with winget (Visual
    Studio can take 20+ minutes), brings in and verifies the game files, then recompiles and builds the game.
    The progress bar is an estimate and can sit still for minutes. **Cancel** stops everything; running setup
-   again skips finished steps. Output is saved to `setup.log`.
-5. Press **Play**. The other pages hold the game's options. The **Launcher** page has extra arguments and
-   environment variables and a preview of the command. `<game>_launcher.exe --play` starts with your saved
-   settings.
+   again skips finished steps. Output is saved to `setup.log`. Once the game is set up, the button reads
+   **Set up again…**: it rebuilds the game from scratch (after a confirmation) and keeps your settings and saves.
+5. Press **Play**. The other pages hold the game's options. The **Saves** page lists your saves and can
+   rename them or delete them (to the Recycle Bin). The **Launcher** page has extra arguments and environment
+   variables and a preview of the command. Next time, the launcher opens on the Launcher page.
+   `<game>_launcher.exe --play` starts with your saved settings.
 
 ## Troubleshooting
 

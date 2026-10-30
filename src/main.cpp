@@ -3,6 +3,7 @@
 // Everything game specific lives in a manifest, launcher.ini, next to the launcher or in one of its
 // parent directories (see DEVELOPERS.md). The user's choices are saved to launcher.user.ini beside it.
 // A manifest with a [setup] section also gets a Setup page: the player's disc in, then the build steps.
+// One with [saves] gets a Saves page that renames and deletes the game's save games.
 //
 //   launcher.exe                     settings window
 //   launcher.exe --play              launch straight away with the saved settings
@@ -184,6 +185,7 @@ struct Setting {
   Kind kind = Kind::Text;
   std::vector<Choice> choices;
   int min = INT_MIN, max = INT_MAX;
+  int max_length = 0;  // text: most characters allowed, 0 = no limit
   bool allow_empty = true;
   wstring value;
   HWND label_wnd = nullptr, ctl = nullptr, help_wnd = nullptr;
@@ -214,6 +216,15 @@ struct Setup {
   std::vector<Step> steps;
 };
 
+// Save games page: where the game keeps its saves, and how they are laid out (see list_saves).
+struct Saves {
+  bool present = false;
+  wstring format, dir;  // format: xbox or xbox360
+  // A text setting holding the profile name the game shows for every save (an Xbox 360 gamertag). When set,
+  // the list shows it as each save's name and Rename changes the setting instead of the save.
+  wstring name_setting;
+};
+
 struct Game {
   wstring manifest, root, user_file;
   wstring title, subtitle, exe, workdir, args, stdout_log, stderr_log, log;
@@ -223,6 +234,7 @@ struct Game {
   std::vector<Setting> settings;
   std::vector<wstring> groups;  // in order of first appearance
   Setup setup;
+  Saves saves;
   // Launcher options (saved in the user file).
   wstring extra_args, extra_env, setup_source;
   bool show_console = true, close_on_launch = false;
@@ -238,9 +250,19 @@ wstring find_manifest(const wstring& start_dir) {
   }
 }
 
+// The user's Documents folder, which may be moved off %USERPROFILE% (Xbox 360 runtimes keep saves there).
+wstring documents_dir() {
+  wchar_t* p = nullptr;
+  wstring out;
+  if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr, &p))) out = p;
+  CoTaskMemFree(p);
+  return out;
+}
+
 wstring substitute(const Game& g, wstring s) {
   replace_all(s, L"{root}", g.root);
   if (s.find(L"{exe_dir}") != wstring::npos) replace_all(s, L"{exe_dir}", dir_of(join(g.root, g.exe)));
+  if (s.find(L"{documents}") != wstring::npos) replace_all(s, L"{documents}", documents_dir());
   return expand_env(s);
 }
 
@@ -306,6 +328,7 @@ bool load_manifest(Game& g, const wstring& path, wstring& err) {
       if (!v.empty()) s.max = _wtoi(v.c_str());
       s.allow_empty = ini_get(m, sec, L"allow_empty", L"0") == L"1";
     }
+    if (s.kind == Kind::Text) s.max_length = std::max(0, _wtoi(ini_get(m, sec, L"max_length").c_str()));
     if (s.env.empty() && s.arg.empty()) {
       err = L"[" + sec + L"] needs env= or arg=";
       return false;
@@ -372,6 +395,29 @@ bool load_manifest(Game& g, const wstring& path, wstring& err) {
       if (!su.game_dir.empty() && !su.game_check.empty()) su.done_when.push_back(su.game_dir + L"\\" + su.game_check);
     }
   }
+
+  for (auto& sec : ini_sections(m))
+    if (lower(sec) == L"saves") g.saves.present = true;
+  if (g.saves.present) {
+    g.saves.format = lower(ini_get(m, L"saves", L"format", L"xbox"));
+    g.saves.dir = ini_get(m, L"saves", L"dir");
+    if (g.saves.format != L"xbox" && g.saves.format != L"xbox360") {
+      err = L"[saves] format= must be xbox or xbox360";
+      return false;
+    }
+    if (g.saves.dir.empty()) {
+      err = L"[saves] needs dir=";
+      return false;
+    }
+    g.saves.name_setting = ini_get(m, L"saves", L"name_setting");
+    if (!g.saves.name_setting.empty() &&
+        std::none_of(g.settings.begin(), g.settings.end(), [&](const Setting& s) {
+          return s.kind == Kind::Text && lower(s.id) == lower(g.saves.name_setting);
+        })) {
+      err = L"[saves] name_setting=" + g.saves.name_setting + L" is not a [setting.*] of type=text";
+      return false;
+    }
+  }
   return true;
 }
 
@@ -401,6 +447,10 @@ void save_user(const Game& g) {
   ini_set(g.user_file, L"launcher", L"show_console", g.show_console ? L"1" : L"0");
   ini_set(g.user_file, L"launcher", L"close_on_launch", g.close_on_launch ? L"1" : L"0");
 }
+
+// The player has been through the settings: they saved them, or played (which saves them). Setup writes
+// only its own [setup] section, so a freshly set-up game does not count.
+bool user_configured(const Game& g) { return !ini_pairs(g.user_file, L"launcher").empty(); }
 
 // ---------------------------------------------------------------------------------------------
 // Launching
@@ -579,6 +629,245 @@ HANDLE launch(const Game& g, const wstring& passthrough, wstring& err) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Save games ([saves])
+// ---------------------------------------------------------------------------------------------
+//
+// xbox:     dir is UDATA\<title id>. Each folder in it is a save; its SaveMeta.xbx (UTF-16LE text,
+//           KEY=value lines) holds Name=, the name the game and the dashboard list.
+// xbox360:  dir is <user data root>\<xuid>\<title id>. Saves are the folders in 00000001 (the saved-game
+//           content type); Headers\00000001\<folder>.header holds the display name.
+// The folder name is the save's identity, which the game looks it up by: rename changes only the name.
+
+struct SaveGame {
+  wstring id, name, path, header;  // header: the Xbox 360 content header that holds the name
+  FILETIME modified{};
+  uint64_t size = 0;
+};
+
+const wchar_t kSaveContentType[] = L"00000001";
+constexpr size_t kSaveNameMax = 127;  // both formats keep 128 characters with the terminator
+// Xbox 360 content header: u32 device id and u32 content type (big-endian), then the display name as
+// 128 big-endian UTF-16 characters.
+constexpr size_t kHeaderName = 8, kHeaderNameChars = 128;
+
+wstring saves_dir(const Game& g) { return join(g.root, substitute(g, g.saves.dir)); }
+
+// [saves] name_setting, or null.
+Setting* name_setting(Game& g) {
+  if (g.saves.name_setting.empty()) return nullptr;
+  for (auto& s : g.settings)
+    if (lower(s.id) == lower(g.saves.name_setting)) return &s;
+  return nullptr;
+}
+
+wstring profile_name(const Setting& s) { return s.value.empty() ? s.def : s.value; }
+
+std::vector<wstring> subdirs(const wstring& dir) {
+  std::vector<wstring> out;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return out;
+  do {
+    if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L".."))
+      out.emplace_back(fd.cFileName);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  return out;
+}
+
+// Total size and newest write time of the files under dir.
+void tree_stats(const wstring& dir, uint64_t& size, FILETIME& latest) {
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) tree_stats(dir + L"\\" + fd.cFileName, size, latest);
+    } else {
+      size += ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+      if (CompareFileTime(&fd.ftLastWriteTime, &latest) > 0) latest = fd.ftLastWriteTime;
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
+bool read_bytes(const wstring& path, std::string& out) {
+  HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                         nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER size{};
+  bool ok = GetFileSizeEx(f, &size) && size.QuadPart < (16 << 20);
+  DWORD n = 0;
+  if (ok) {
+    out.resize((size_t)size.QuadPart);
+    ok = out.empty() || (ReadFile(f, out.data(), (DWORD)out.size(), &n, nullptr) && n == out.size());
+  }
+  CloseHandle(f);
+  return ok;
+}
+
+// Writes a sibling temporary file and moves it over path, so a failed write leaves the old file whole.
+bool replace_bytes(const wstring& path, const std::string& data) {
+  wstring tmp = path + L".tmp";
+  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  DWORD n = 0;
+  bool ok = WriteFile(f, data.data(), (DWORD)data.size(), &n, nullptr) && n == data.size();
+  CloseHandle(f);
+  ok = ok && MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  if (!ok) DeleteFileW(tmp.c_str());
+  return ok;
+}
+
+std::vector<wstring> savemeta_lines(const wstring& path) {
+  std::vector<wstring> lines;
+  std::string b;
+  if (!read_bytes(path, b)) return lines;
+  wstring t;
+  if (b.size() >= 2 && (uint8_t)b[0] == 0xFF && (uint8_t)b[1] == 0xFE) {
+    t.resize((b.size() - 2) / 2);
+    memcpy(t.data(), b.data() + 2, t.size() * 2);
+  } else {
+    int n = MultiByteToWideChar(CP_UTF8, 0, b.data(), (int)b.size(), nullptr, 0);
+    t.resize(n);
+    MultiByteToWideChar(CP_UTF8, 0, b.data(), (int)b.size(), t.data(), n);
+  }
+  for (auto& l : split(t, L'\n')) {
+    wstring x = l;
+    if (!x.empty() && x.back() == L'\r') x.pop_back();
+    if (!x.empty()) lines.push_back(x);
+  }
+  return lines;
+}
+
+bool is_name_line(const wstring& l) { return lower(l).rfind(L"name=", 0) == 0; }
+
+wstring savemeta_name(const wstring& path) {
+  for (auto& l : savemeta_lines(path))
+    if (is_name_line(l)) return l.substr(5);
+  return L"";
+}
+
+// Keeps the other lines (NoCopy= and the like) as they are.
+bool savemeta_set_name(const wstring& path, const wstring& name) {
+  auto lines = savemeta_lines(path);
+  bool found = false;
+  for (auto& l : lines)
+    if (is_name_line(l)) {
+      l = L"Name=" + name;
+      found = true;
+    }
+  if (!found) lines.insert(lines.begin(), L"Name=" + name);
+  wstring t = L"\xFEFF";
+  for (auto& l : lines) t += l + L"\r\n";
+  return replace_bytes(path, std::string((const char*)t.data(), t.size() * sizeof(wchar_t)));
+}
+
+wstring header_name(const wstring& path) {
+  std::string b;
+  if (!read_bytes(path, b) || b.size() < kHeaderName + kHeaderNameChars * 2) return L"";
+  wstring n;
+  for (size_t i = 0; i < kHeaderNameChars; ++i) {
+    wchar_t c = (wchar_t)(((uint8_t)b[kHeaderName + 2 * i] << 8) | (uint8_t)b[kHeaderName + 2 * i + 1]);
+    if (!c) break;
+    n += c;
+  }
+  return n;
+}
+
+bool header_set_name(const wstring& path, const wstring& name) {
+  std::string b;
+  if (!read_bytes(path, b) || b.size() < kHeaderName + kHeaderNameChars * 2) return false;
+  for (size_t i = 0; i < kHeaderNameChars; ++i) {
+    wchar_t c = i < name.size() ? name[i] : 0;
+    b[kHeaderName + 2 * i] = (char)(c >> 8);
+    b[kHeaderName + 2 * i + 1] = (char)(c & 0xFF);
+  }
+  return replace_bytes(path, b);
+}
+
+// Newest first. With a name setting, every save goes by the profile name.
+std::vector<SaveGame> list_saves(Game& g) {
+  std::vector<SaveGame> out;
+  const Setting* profile = name_setting(g);
+  wstring dir = saves_dir(g);
+  bool x360 = g.saves.format == L"xbox360";
+  wstring base = x360 ? dir + L"\\" + kSaveContentType : dir;
+  for (auto& id : subdirs(base)) {
+    SaveGame s;
+    s.id = id;
+    s.path = base + L"\\" + id;
+    if (x360) {
+      s.header = dir + L"\\Headers\\" + kSaveContentType + L"\\" + id + L".header";
+      s.name = header_name(s.header);
+    } else {
+      s.name = savemeta_name(s.path + L"\\SaveMeta.xbx");
+    }
+    if (profile && !profile_name(*profile).empty()) s.name = profile_name(*profile);
+    if (trim(s.name).empty()) s.name = id;
+    tree_stats(s.path, s.size, s.modified);
+    out.push_back(s);
+  }
+  std::sort(out.begin(), out.end(),
+            [](const SaveGame& a, const SaveGame& b) { return CompareFileTime(&a.modified, &b.modified) > 0; });
+  return out;
+}
+
+bool rename_save(const Game& g, const SaveGame& s, const wstring& name, wstring& err) {
+  bool ok;
+  if (g.saves.format == L"xbox360") {
+    if (!file_exists(s.header)) {
+      err = L"This save has no header to hold its name:\n" + s.header;
+      return false;
+    }
+    ok = header_set_name(s.header, name);
+  } else {
+    ok = savemeta_set_name(s.path + L"\\SaveMeta.xbx", name);
+  }
+  if (!ok) err = L"Could not write the new name into\n" + (s.header.empty() ? s.path + L"\\SaveMeta.xbx" : s.header);
+  return ok;
+}
+
+// To the Recycle Bin, with the Xbox 360 header that goes with it.
+bool delete_save(HWND owner, const SaveGame& s, wstring& err) {
+  wstring from = s.path + L'\0';
+  if (!s.header.empty() && file_exists(s.header)) from += s.header + L'\0';
+  from += L'\0';
+  SHFILEOPSTRUCTW op{};
+  op.hwnd = owner;
+  op.wFunc = FO_DELETE;
+  op.pFrom = from.c_str();
+  op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+  int r = SHFileOperationW(&op);
+  if (r != 0 || op.fAnyOperationsAborted || path_exists(s.path)) {
+    err = L"Could not delete\n" + s.path + L"\n\nIs the game still running, or a file in it open?";
+    return false;
+  }
+  return true;
+}
+
+wstring format_time(const FILETIME& ft) {
+  if (!ft.dwLowDateTime && !ft.dwHighDateTime) return L"";
+  SYSTEMTIME utc, local;
+  FileTimeToSystemTime(&ft, &utc);
+  SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+  wchar_t d[64] = L"", t[64] = L"";
+  GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, nullptr, d, 64, nullptr);
+  GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, t, 64);
+  return wstring(d) + L"  " + t;
+}
+
+wstring format_size(uint64_t bytes) {
+  wchar_t b[32];
+  if (bytes < 1024 * 1024)
+    swprintf(b, 32, L"%llu KB", (unsigned long long)std::max<uint64_t>(1, (bytes + 1023) / 1024));
+  else
+    swprintf(b, 32, L"%.1f MB", bytes / 1048576.0);
+  return b;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Window
 // ---------------------------------------------------------------------------------------------
 
@@ -602,6 +891,11 @@ enum : int {
   IDC_SETUP_CANCEL,
   IDC_SETUP_LOG,
   IDC_SETUP_BAR,
+  IDC_SAVES_LIST,
+  IDC_SAVES_FOLDER,
+  IDC_SAVES_REFRESH,
+  IDC_SAVES_RENAME,
+  IDC_SAVES_DELETE,
   IDC_SETTING0 = 1000,
 };
 constexpr UINT WM_GAME_EXITED = WM_APP + 1;
@@ -631,9 +925,12 @@ struct App {
   HWND extra_args = nullptr, extra_env = nullptr, show_console = nullptr, close_on_launch = nullptr;
   HWND setup_source = nullptr, setup_source_help = nullptr, setup_steps = nullptr, setup_log = nullptr;
   HWND setup_run = nullptr, setup_cancel_btn = nullptr, setup_bar = nullptr;
+  HWND saves_list = nullptr, saves_info = nullptr, saves_rename = nullptr, saves_delete = nullptr;
+  std::vector<SaveGame> saves;  // in list order
   std::vector<Row> rows;
   std::vector<wstring> nav_items;
   int group_base = 0;  // nav index of the first settings group (1 when there is a Setup page)
+  int saves_page = -1, launcher_page = 0;
   HFONT font = nullptr, title_font = nullptr, small_font = nullptr;
   HBRUSH bg = nullptr;
   UINT dpi = 96;
@@ -643,6 +940,7 @@ struct App {
   // Setup
   HANDLE setup_thread = nullptr, setup_job = nullptr, setup_log_file = nullptr;
   std::atomic<bool> setup_cancel{false};
+  bool setup_force = false;  // Set up again: run every step, skip_if or not
   std::vector<wstring> setup_items;
   std::vector<int> setup_states;
   bool setup_active = false;  // the progress bar is shown while setup runs
@@ -837,6 +1135,12 @@ void layout() {
       bool combo = _wcsicmp(cls, WC_COMBOBOXW) == 0;
       MoveWindow(r.ctl, cx, top + y, cw, combo ? S(300) : ch, FALSE);
     }
+    if (r.ctl && r.ctl == app.saves_list) {
+      int name_w = cw - S(4) - GetSystemMetricsForDpi(SM_CXVSCROLL, app.dpi) - S(140) - S(80);
+      ListView_SetColumnWidth(app.saves_list, 0, std::max(S(80), name_w));
+      ListView_SetColumnWidth(app.saves_list, 1, S(140));
+      ListView_SetColumnWidth(app.saves_list, 2, S(80));
+    }
     int help_y = top + y + std::max(ch, rowh) + S(2);
     if (r.help) MoveWindow(r.help, cx, help_y, cw, h - rowh, FALSE);
     y += std::max(ch, rowh) + (h - rowh) + gap;
@@ -865,7 +1169,104 @@ void layout() {
   RedrawWindow(app.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);  // children moved without repainting
 }
 
+int selected_save() {
+  int i = app.saves_list ? ListView_GetNextItem(app.saves_list, -1, LVNI_SELECTED) : -1;
+  return i >= 0 && i < (int)app.saves.size() ? i : -1;
+}
+
+// Saves change only while the game is not running: it may hold them open, or write them back on exit.
+void update_save_buttons() {
+  if (!app.saves_list) return;
+  bool can = selected_save() >= 0 && !app.running;
+  EnableWindow(app.saves_rename, can);
+  EnableWindow(app.saves_delete, can);
+}
+
+void refresh_saves() {
+  if (!app.saves_list) return;
+  if (Setting* p = name_setting(app.g)) control_to_value(*p);  // as typed on its page, saved or not
+  app.saves = list_saves(app.g);
+  SendMessageW(app.saves_list, WM_SETREDRAW, FALSE, 0);
+  ListView_DeleteAllItems(app.saves_list);
+  for (size_t i = 0; i < app.saves.size(); ++i) {
+    const SaveGame& s = app.saves[i];
+    LVITEMW it{LVIF_TEXT};
+    it.iItem = (int)i;
+    it.pszText = (wchar_t*)s.name.c_str();
+    ListView_InsertItem(app.saves_list, &it);
+    wstring when = format_time(s.modified), size = format_size(s.size);
+    ListView_SetItemText(app.saves_list, (int)i, 1, when.data());
+    ListView_SetItemText(app.saves_list, (int)i, 2, size.data());
+  }
+  SendMessageW(app.saves_list, WM_SETREDRAW, TRUE, 0);
+  wstring dir = saves_dir(app.g);
+  wstring info = app.saves.empty() ? L"No saves yet. The game keeps them in " + dir
+                 : (app.saves.size() == 1 ? wstring(L"1 save") : std::to_wstring(app.saves.size()) + L" saves") +
+                       L" in " + dir;
+  if (info != window_text(app.saves_info)) {
+    SetWindowTextW(app.saves_info, info.c_str());
+    layout();
+  }
+  update_save_buttons();
+}
+
+void begin_rename_save() {
+  int i = selected_save();
+  if (i < 0 || app.running) return;
+  SetFocus(app.saves_list);
+  ListView_EditLabel(app.saves_list, i);
+}
+
+// From the label edit: true keeps the new text in the list.
+bool rename_selected_save(int i, const wstring& text) {
+  if (i < 0 || i >= (int)app.saves.size() || app.running) return false;
+  wstring name = trim(text);
+  if (name.empty() || name == app.saves[i].name) return false;
+  if (std::any_of(name.begin(), name.end(), [](wchar_t c) { return c < 0x20; })) return false;
+  if (Setting* p = name_setting(app.g)) {
+    // The profile name: a setting passed on the command line, where a quote would break the argument.
+    if (name.find(L'"') != wstring::npos || (p->max_length && (int)name.size() > p->max_length)) {
+      set_status(L"A profile name cannot contain \"" +
+                 (p->max_length ? L" and is at most " + std::to_wstring(p->max_length) + L" characters" : L""));
+      return false;
+    }
+    p->value = name;
+    ini_set(app.g.user_file, L"settings", p->id, name);  // only this setting, not other unsaved changes
+    app.loading = true;
+    value_to_control(*p);
+    app.loading = false;
+    update_cmdline();
+    set_status(L"Profile name is now \"" + name + L"\" (the game uses it from its next start)");
+    PostMessageW(app.wnd, WM_COMMAND, IDC_SAVES_REFRESH, 0);  // every save shows it; not from inside the edit
+    return true;
+  }
+  wstring err;
+  if (!rename_save(app.g, app.saves[i], name, err)) {
+    MessageBoxW(app.wnd, err.c_str(), app.g.title.c_str(), MB_ICONERROR);
+    return false;
+  }
+  set_status(L"Renamed \"" + app.saves[i].name + L"\" to \"" + name + L"\"");
+  app.saves[i].name = name;
+  return true;
+}
+
+void delete_selected_save() {
+  int i = selected_save();
+  if (i < 0 || app.running) return;
+  const SaveGame& s = app.saves[i];
+  wstring q = L"Delete the save \"" + s.name + L"\"?\n\nIt goes to the Recycle Bin, where you can restore it from.";
+  if (MessageBoxW(app.wnd, q.c_str(), app.g.title.c_str(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+  wstring err, name = s.name;
+  if (!delete_save(app.wnd, s, err)) {
+    MessageBoxW(app.wnd, err.c_str(), app.g.title.c_str(), MB_ICONERROR);
+  } else {
+    set_status(L"Deleted \"" + name + L"\" (it is in the Recycle Bin)");
+  }
+  refresh_saves();
+}
+
 void show_page(int page) {
+  if (page == app.saves_page) refresh_saves();
   app.page = page;
   for (auto& r : app.rows) {
     int show = r.group == page ? SW_SHOW : SW_HIDE;
@@ -1521,7 +1922,7 @@ DWORD WINAPI setup_thread(void* p) {
   for (size_t i = 0; ok && !app.setup_cancel && i < su.steps.size(); ++i) {
     const Step& st = su.steps[i];
     int item = (int)i + 2;
-    if (!st.skip_if.empty() && path_exists(join(g.root, substitute(g, st.skip_if)))) {
+    if (!app.setup_force && !st.skip_if.empty() && path_exists(join(g.root, substitute(g, st.skip_if)))) {
       slog(L"");
       slog(L"== " + st.label + L": already done (" + st.skip_if + L" exists)");
       sstate(item, Skipped);
@@ -1623,8 +2024,34 @@ void set_setup_running(bool on) {
       for (HWND b : r.buttons) EnableWindow(b, !on);
 }
 
+// Already set up: the button offers to do it all again, and the steps show as done until then.
+// mark_steps: also show every step done (not after a run, whose own marks say how it went).
+void update_setup_done(bool mark_steps) {
+  if (!app.setup_run || app.setup_thread) return;
+  bool done = !setup_needed(app.g);
+  SetWindowTextW(app.setup_run, done ? L"Set up again…" : L"Run setup");
+  if (done && mark_steps) {
+    app.setup_states.assign(app.setup_items.size(), Done);
+    update_setup_steps();
+    SetWindowTextW(app.setup_log,
+                   L"Setup is done: the game is built and ready to play.\r\n\r\nSet up again only to rebuild it from "
+                   L"scratch, for example after updating the game's files or when the build is broken.");
+  }
+}
+
 void start_setup() {
   if (app.setup_thread || app.running) return;
+  app.setup_force = !setup_needed(app.g);
+  if (app.setup_force) {
+    wstring q = app.g.title +
+                L" is already set up.\n\nSetting it up again runs every step from the start, finished or not: it "
+                L"checks the tools, brings in the game files again if you chose a new copy, and recompiles and "
+                L"rebuilds the game from scratch, which takes as long as the first setup. Until it finishes you "
+                L"cannot play, and if a step fails the game may not start until setup succeeds.\n\nYour settings "
+                L"and save games are kept.\n\nSet the game up again?";
+    if (MessageBoxW(app.wnd, q.c_str(), app.g.title.c_str(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
+      return;
+  }
   wstring source = app.setup_source ? trim(window_text(app.setup_source)) : L"";
   app.g.setup_source = source;
   ini_set(app.g.user_file, L"setup", L"source", source);
@@ -1638,7 +2065,8 @@ void start_setup() {
   app.setup_states.assign(app.setup_items.size(), Pending);
   update_setup_steps();
   app.setup_cancel = false;
-  slog(L"Setting up " + app.g.title + L" in " + app.g.root + L" (log: " + log + L")");
+  slog((app.setup_force ? L"Setting up again (every step) " : L"Setting up ") + app.g.title + L" in " + app.g.root +
+       L" (log: " + log + L")");
   app.setup_thread = CreateThread(nullptr, 0, setup_thread, new wstring(source), 0, nullptr);
   set_setup_running(true);
 }
@@ -1699,6 +2127,7 @@ void do_play() {
   }
   app.running = h;
   EnableWindow(app.play, FALSE);
+  update_save_buttons();
   set_status(L"Running (pid " + std::to_wstring(GetProcessId(h)) + L")");
   CloseHandle(CreateThread(nullptr, 0, wait_thread, h, 0, nullptr));
 }
@@ -1714,6 +2143,11 @@ void create_controls() {
   app.group_base = g.setup.present ? 1 : 0;
   if (g.setup.present) app.nav_items.push_back(L"Setup");
   app.nav_items.insert(app.nav_items.end(), g.groups.begin(), g.groups.end());
+  if (g.saves.present) {
+    app.saves_page = (int)app.nav_items.size();
+    app.nav_items.push_back(L"Saves");
+  }
+  app.launcher_page = (int)app.nav_items.size();
   app.nav_items.push_back(L"Launcher");
   for (auto& n : app.nav_items) SendMessageW(app.nav, LB_ADDSTRING, 0, (LPARAM)n.c_str());
 
@@ -1766,6 +2200,7 @@ void create_controls() {
         for (auto& c : s.choices) SendMessageW(r.ctl, CB_ADDSTRING, 0, (LPARAM)c.label.c_str());
       } else {
         r.ctl = child(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, id, WS_EX_CLIENTEDGE);
+        if (s.max_length) SendMessageW(r.ctl, EM_LIMITTEXT, s.max_length, 0);
       }
     }
     wstring help = s.help;
@@ -1781,8 +2216,38 @@ void create_controls() {
     ++id;
   }
 
+  if (g.saves.present) {
+    int sp = app.saves_page;
+    const wchar_t* about =
+        g.saves.name_setting.empty()
+            ? L"Rename changes the name the game shows for a save (or select it and press F2); the save itself "
+              L"stays as it is. Delete moves a save to the Recycle Bin."
+            : L"Saves go by your profile name, which the game also shows in its menus. Rename (or F2) changes "
+              L"it for every save, from the game's next start. Delete moves a save to the Recycle Bin.";
+    HWND intro = child(WC_STATICW, about, SS_NOPREFIX, 0);
+    app.rows.push_back({sp, nullptr, intro, nullptr, {}, 0, true});
+    app.saves_list = child(WC_LISTVIEWW, L"",
+                           WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_EDITLABELS,
+                           IDC_SAVES_LIST, WS_EX_CLIENTEDGE);
+    ListView_SetExtendedListViewStyle(app.saves_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    const wchar_t* cols[] = {L"Name", L"Last saved", L"Size"};
+    for (int i = 0; i < 3; ++i) {
+      LVCOLUMNW c{LVCF_TEXT | LVCF_FMT};
+      c.fmt = i == 2 ? LVCFMT_RIGHT : LVCFMT_LEFT;
+      c.pszText = (wchar_t*)cols[i];
+      ListView_InsertColumn(app.saves_list, i, &c);
+    }
+    app.saves_info = child(WC_STATICW, L"", SS_NOPREFIX | SS_PATHELLIPSIS, 0);
+    app.rows.push_back({sp, nullptr, app.saves_list, app.saves_info, {}, 200});
+    HWND folder = child(WC_BUTTONW, L"Saves folder", WS_TABSTOP, IDC_SAVES_FOLDER);
+    HWND refresh = child(WC_BUTTONW, L"Refresh", WS_TABSTOP, IDC_SAVES_REFRESH);
+    app.saves_rename = child(WC_BUTTONW, L"Rename", WS_TABSTOP | WS_DISABLED, IDC_SAVES_RENAME);
+    app.saves_delete = child(WC_BUTTONW, L"Delete…", WS_TABSTOP | WS_DISABLED, IDC_SAVES_DELETE);
+    app.rows.push_back({sp, nullptr, nullptr, nullptr, {folder, refresh, app.saves_rename, app.saves_delete}});
+  }
+
   // Launcher page.
-  int lp = (int)app.nav_items.size() - 1;
+  int lp = app.launcher_page;
   HWND l1 = child(WC_STATICW, L"Extra arguments:", SS_NOPREFIX, 0);
   app.extra_args = child(WC_EDITW, L"", WS_TABSTOP | ES_AUTOHSCROLL, IDC_EXTRA_ARGS, WS_EX_CLIENTEDGE);
   HWND h1 = child(WC_STATICW, L"Appended to the game's command line.", SS_NOPREFIX, 0);
@@ -1828,9 +2293,11 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       apply_fonts();
       write_controls();
       update_setup_steps();
+      update_setup_done(true);
       update_setup_source_help();
       layout();
-      show_page(setup_needed(app.g) ? 0 : app.group_base);
+      // Not built yet: Setup. Built but never configured: the first page after Setup. Otherwise: Launcher.
+      show_page(setup_needed(app.g) ? 0 : user_configured(app.g) ? app.launcher_page : app.group_base);
       update_cmdline();
       refresh_status();
       return 0;
@@ -1863,6 +2330,33 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return (LRESULT)app.bg;
     }
+    case WM_NOTIFY: {
+      auto* nm = (NMHDR*)lp;
+      if (nm->idFrom != IDC_SAVES_LIST) break;
+      switch (nm->code) {
+        case LVN_ITEMCHANGED:
+          update_save_buttons();
+          return 0;
+        case LVN_KEYDOWN: {
+          WORD key = ((NMLVKEYDOWN*)lp)->wVKey;
+          if (key == VK_F2) begin_rename_save();
+          if (key == VK_DELETE) delete_selected_save();
+          return 0;
+        }
+        case LVN_BEGINLABELEDIT:
+          if (app.running) return TRUE;  // cancels the edit
+          if (HWND e = ListView_GetEditControl(app.saves_list)) {
+            Setting* p = name_setting(app.g);
+            SendMessageW(e, EM_LIMITTEXT, p && p->max_length ? p->max_length : kSaveNameMax, 0);
+          }
+          return FALSE;
+        case LVN_ENDLABELEDIT: {
+          auto* di = (NMLVDISPINFOW*)lp;
+          return di->item.pszText && rename_selected_save(di->item.iItem, di->item.pszText);
+        }
+      }
+      break;
+    }
     case WM_MEASUREITEM: {
       auto* mi = (MEASUREITEMSTRUCT*)lp;
       mi->itemHeight = S(28);
@@ -1892,15 +2386,35 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_COMMAND: {
       int id = LOWORD(wp), code = HIWORD(wp);
+      // The list view's rename box has control ID 1, which is IDOK (Play): its EN_* notifications are not ours.
+      if (lp && app.saves_list && (HWND)lp == ListView_GetEditControl(app.saves_list)) break;
       if (id == IDC_NAV && code == LBN_SELCHANGE) {
         show_page((int)SendMessageW(app.nav, LB_GETCURSEL, 0, 0));
         return 0;
+      }
+      switch (id) {
+        case IDC_SAVES_REFRESH:
+          refresh_saves();
+          return 0;
+        case IDC_SAVES_RENAME:
+          begin_rename_save();
+          return 0;
+        case IDC_SAVES_DELETE:
+          delete_selected_save();
+          return 0;
+        case IDC_SAVES_FOLDER: {
+          wstring dir = saves_dir(app.g);
+          if (path_exists(dir)) ShellExecuteW(h, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          else set_status(L"No saves folder yet: " + dir);
+          return 0;
+        }
       }
       if ((id >= IDC_SETTING0 || id == IDC_EXTRA_ARGS || id == IDC_EXTRA_ENV) &&
           (code == EN_CHANGE || code == CBN_SELCHANGE || code == BN_CLICKED)) {
         update_cmdline();
         return 0;
       }
+      if (code != BN_CLICKED) break;  // the rest are buttons (and IDOK / IDCANCEL from dialog keys)
       switch (id) {
         case IDC_PLAY:
           if (!app.running) do_play();
@@ -1949,6 +2463,8 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       CloseHandle(app.running);
       app.running = nullptr;
       EnableWindow(app.play, TRUE);
+      if (app.page == app.saves_page) refresh_saves();  // the game may have saved
+      update_save_buttons();
       wchar_t buf[96];
       swprintf(buf, 96, L"Game exited with code %ld (0x%08lX)", (long)code, (unsigned long)code);
       set_status(buf);
@@ -1987,10 +2503,12 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         app.setup_job = nullptr;
       }
       set_setup_running(false);
+      update_setup_done(false);
       update_setup_source_help();
       layout();
       refresh_status();
       if (wp) {
+        if (!user_configured(app.g)) show_page(app.group_base);  // on to the settings
         set_status(L"Setup finished. Press Play.");
       } else {
         set_status(*err);
@@ -2046,12 +2564,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     MessageBoxW(nullptr,
                 L"No launcher.ini was found next to the launcher or in any parent folder.\n\n"
                 L"Pass one with --manifest <path>.",
-                L"Recomp launcher", MB_ICONERROR);
+                L"Xbox Recomp Launcher", MB_ICONERROR);
     return 1;
   }
   wstring err;
   if (!load_manifest(app.g, manifest, err)) {
-    MessageBoxW(nullptr, err.c_str(), L"Recomp launcher", MB_ICONERROR);
+    MessageBoxW(nullptr, err.c_str(), L"Xbox Recomp Launcher", MB_ICONERROR);
     return 1;
   }
   load_user(app.g);
@@ -2068,12 +2586,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   }
 
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);  // file dialogs
-  INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS};
+  INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS | ICC_LISTVIEW_CLASSES};
   InitCommonControlsEx(&icc);
 
-  // The game's own icon, when it has one.
+  // The game's own icon when it has one, else the launcher's (launcher.rc).
   HICON big = nullptr, small_icon = nullptr;
   ExtractIconExW(join(app.g.root, substitute(app.g, app.g.exe)).c_str(), 0, &big, &small_icon, 1);
+  if (!big) {
+    if (small_icon) DestroyIcon(small_icon);
+    small_icon = nullptr;
+    LoadIconMetric(inst, MAKEINTRESOURCEW(1), LIM_LARGE, &big);
+    LoadIconMetric(inst, MAKEINTRESOURCEW(1), LIM_SMALL, &small_icon);
+  }
   if (!big) big = LoadIconW(nullptr, IDI_APPLICATION);
 
   WNDCLASSEXW wc{sizeof wc};
@@ -2086,7 +2610,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   wc.hIconSm = small_icon ? small_icon : big;
   RegisterClassExW(&wc);
 
-  wstring caption = app.g.title + L" \u2013 Launcher";
+  wstring caption = app.g.title + L" \u2013 Xbox Recomp Launcher";
   HWND wnd = CreateWindowExW(0, wc.lpszClassName, caption.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU |
                              WS_MINIMIZEBOX | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, 720, 520, nullptr,
                              nullptr, inst, nullptr);
@@ -2104,8 +2628,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   SetFocus(app.play);
 
   MSG m;
+  HWND rename_box = nullptr;
   while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-    if (IsDialogMessageW(wnd, &m)) continue;
+    // Enter and Esc in a save's rename box end the edit; as dialog keys they would press a button. The
+    // WM_CHAR that TranslateMessage posts for that Enter arrives after the key down has closed the box, so
+    // the last box is remembered: its leftovers must not reach the dialog manager either.
+    if (HWND box = app.saves_list ? ListView_GetEditControl(app.saves_list) : nullptr) rename_box = box;
+    if (!(rename_box && m.hwnd == rename_box) && IsDialogMessageW(wnd, &m)) continue;
     TranslateMessage(&m);
     DispatchMessageW(&m);
   }
