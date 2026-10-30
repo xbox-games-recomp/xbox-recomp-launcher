@@ -1,0 +1,3 @@
+// The launcher's icon (tools/make_icon.py draws it): Explorer, the taskbar, and the window when the
+// game's executable has no icon of its own.
+1 ICON "launcher.ico"

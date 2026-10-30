@@ -13,8 +13,10 @@ if(NOT WIN32)
   return()
 endif()
 
+enable_language(RC)
 # CMake hands .manifest sources to the linker (/MANIFESTINPUT): common controls v6 and per-monitor DPI.
-add_executable(recomp_launcher WIN32 src/main.cpp src/launcher.manifest)
+# launcher.rc carries the icon.
+add_executable(recomp_launcher WIN32 src/main.cpp src/launcher.manifest src/launcher.rc)
 target_compile_features(recomp_launcher PRIVATE cxx_std_17)
 target_compile_definitions(recomp_launcher PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(recomp_launcher PRIVATE comctl32 shell32 user32 gdi32 advapi32 ole32 uuid bcrypt)
