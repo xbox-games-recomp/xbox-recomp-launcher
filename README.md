@@ -1,243 +1,155 @@
-# recomp-launcher
+# recomp-launcher: first-time setup and playing
 
-A small settings window and launcher for statically recompiled Xbox / Xbox 360 games. It replaces the
-per-game launch batch files: the player picks graphics, input and logging options in a window,
-presses **Play**, and the launcher starts the game with the matching environment variables and command-line
-arguments, redirecting its output to a log file.
+The launcher for statically recompiled Xbox and Xbox 360 games. It sets the game up from your own disc,
+then starts it with the options you choose.
 
-One launcher serves every game. Everything game specific lives in a `launcher.ini` manifest in the game's
-repository; the launcher is a single dependency-free Win32 executable (C++17, no runtime DLLs).
+This guide is for players. It covers what every game that uses this launcher has in common: getting the
+game ready from your own disc and starting it. Each game's README lists what is specific to that game, namely
+which disc version it needs, how long the build takes and how much disk space it uses.
 
-It also does the **first-time setup**. A recompilation ships no game content, so a fresh clone has nothing to
-run. On the **Setup** page the player points the launcher at their own disc image (or an already extracted
-disc). The launcher checks that the build tools are installed, extracts the disc, checks that it is the
-expected version, and runs the game's recompile and build steps, showing their output as they run. Play is
-available once setup has finished.
+Adding the launcher to a recompilation, or writing a `launcher.ini`? See [DEVELOPERS.md](DEVELOPERS.md).
 
-**Players:** [SETUP.md](SETUP.md) explains first-time setup and the launcher, step by step. This README is for
-people adding the launcher to a recompilation. Game READMEs link to SETUP.md rather than repeating it.
+A recompilation comes with **no game content**. The launcher builds the game on your PC from your own copy of
+the disc, which is why the first start takes a while (20–30 minutes) and needs some free build tools. After that,
+starting the game takes seconds.
 
-## First run from a fresh clone
+## What you need
 
-The games' release zips already contain the launcher. Each game repo has a `release.yml` workflow that, on
-a `v*` tag, zips a shallow clone with its submodules and adds `<game>_launcher.exe` at the root.
+- Windows 10 or 11, 64-bit.
+- **Your own copy of the game**, as either:
+  - a **disc image** (`.iso`) dumped from your own disc. Both a plain "XISO" and a full dump of the whole disc
+    work, for original Xbox and Xbox 360 games, or
+  - a **folder** with the disc already extracted (it holds `default.xbe` for an original Xbox game,
+    `default.xex` for an Xbox 360 game).
 
-In a clone, the launcher is normally built together with the game. Before the first build, get it one of two
-ways:
+  The game's README names the exact version the recompilation was made for. Other versions (other regions,
+  later releases) generally do not work.
+- An internet connection for the first setup, to download the build tools.
+- Free disk space: several GB. The game's README gives the figure.
+- Ideally a short path for the game folder, such as `C:\Games\<game>`. Very long paths can break the build.
 
-- Download `recomp_launcher.exe` from this repository's
-  [releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the game's repository root.
-- Or build it from the game's `launcher` submodule, which takes a few seconds:
+## 1. Get the game
 
-  ```
-  cmake -S launcher -B launcher/build
-  cmake --build launcher/build --config Release
-  ```
+Download the game's release zip (`<game>-<version>-windows.zip`) from its GitHub **Releases** page and unzip
+it to the folder where you want the game. Everything stays inside that folder (one game also builds a helper
+SDK next to it; its README says so).
 
-  The exe ends up in `launcher\build\Release\`. It finds the game's `launcher.ini` in a parent folder.
+If you cloned the repository with git instead, see "From a git clone" at the end.
 
-Run it, choose the disc on the Setup page and press **Run setup**. The game's own build then puts a copy named
-after the game (e.g. `mm3_launcher.exe`) in the repository root, and from then on that copy is the one to use.
+## 2. Start the launcher
 
-## Using it from a game repository
+Double-click `<game>_launcher.exe` in the unzipped folder (for example `mm3_launcher.exe`). Windows may warn
+that the app is from an unknown publisher. The launcher is not code-signed, so choose *More info → Run anyway*
+if you trust where you downloaded it from.
 
-Add this repository as a submodule and hook it into the game's CMake build:
+Until the game is set up, the launcher opens on its **Setup** page:
 
-```
-git submodule add https://github.com/taxidriverhk/recomp-launcher.git launcher
-```
+- at the top, a box for your game copy with the **Disc image…** and **Folder…** buttons;
+- a list of the setup steps (○ to do, ▶ running, ✔ done, – skipped because it is already done, ✖ failed);
+- the output of the running step, with a progress bar above it while setup runs;
+- **Run setup** and **Cancel**.
 
-```cmake
-add_subdirectory(launcher)
-recomp_add_launcher(GAME_TARGET mygame OUTPUT_NAME mygame_launcher COPY_TO_SOURCE_DIR)
-```
+## 3. Choose your game copy
 
-`recomp_add_launcher` copies the launcher next to the game executable as `<OUTPUT_NAME>.exe` on every build.
-With `COPY_TO_SOURCE_DIR` it also copies it to the repository root, next to `launcher.ini`, so it can be
-double-clicked like the old batch file (ignore it in `.gitignore`).
+- **Disc image…** picks an `.iso` file. Setup extracts it into the game folder (`game_files\` or `assets\`,
+  depending on the game). You can delete the `.iso` afterwards.
+- **Folder…** picks a folder that already holds the extracted disc. Nothing is copied: the game folder gets a
+  link to it (a *directory junction*). So **keep that folder where it is**. If you move or delete it, the game
+  can no longer find its files and you will have to choose the copy again.
 
-Then write a `launcher.ini` in the repository root and add `launcher.user.ini` to `.gitignore`.
+You can also paste a path into the box. If the game files are already in place (from an earlier setup), leave
+the box empty.
 
-## Command line
+## 4. Run setup
 
-| | |
+Press **Run setup**. It goes through these steps, showing each one's output as it runs. Everything it prints
+is also saved to `setup.log` in the game folder.
+
+1. **Check the required tools.** The build needs free developer tools: depending on the game, Git, Python,
+   CMake, Visual Studio 2022 with the C++ workload, and LLVM. If some are missing, the launcher lists them and
+   offers to install them with **winget** (Windows' own package manager).
+   - Answer **Yes** and it installs them one after another, then checks again. Windows may ask for
+     administrator permission for each one. **Visual Studio takes the longest, often 20 minutes or more**, and
+     shows little output while it installs. Let it finish.
+   - Answer **No**, or if winget is not available, and the log tells you what to install yourself and from
+     where. Then press **Run setup** again.
+   - After installing Visual Studio, Windows sometimes needs a restart before it is usable. If the check still
+     fails right after the install, restart and run setup again.
+2. **Bring in the game files.** It extracts the disc image (the progress bar follows it) or links the folder.
+   Then it checks that `default.xbe` / `default.xex` is the version the recompilation was made for. If yours is
+   different, it warns you and asks whether to continue. It will most likely not work, so answer **No** unless
+   you know otherwise.
+3. **Recompile and build.** The game's own steps: they translate the game's code to C or C++ and compile it.
+   This is the long part, typically 15–30 minutes, and your PC will be busy. The progress bar is an estimate.
+   During some quiet phases it moves slowly, and the output can stop changing for several minutes. That is
+   normal.
+
+When it is done, the status line says **Setup finished. Press Play.**
+
+**Cancel** stops setup at any time, including every program it started. Pressing **Run setup** again later
+continues where it left off: steps that are already done are skipped.
+
+## 5. Play
+
+Press **Play**. The other pages in the list on the left hold the game's options, such as graphics, input and
+logging. They are saved when you press **Save** or **Play**. **Reset to defaults** restores the game's
+defaults.
+
+The **Launcher** page has:
+
+- **Extra arguments** and **Extra environment**, for options that have no control of their own;
+- **Close the launcher when the game starts** (otherwise it stays open and shows the game's exit code);
+- a preview of exactly what Play runs.
+
+**Open log** opens the game's log file, and **Open folder** opens the game folder.
+
+`<game>_launcher.exe --play` starts the game straight away with your saved settings, which is handy for a
+desktop shortcut.
+
+## Troubleshooting
+
+| Problem | What to do |
 |---|---|
-| `launcher.exe` | Settings window |
-| `launcher.exe --play` | Launch straight away with the saved settings, no window |
-| `launcher.exe --manifest <path>` | Use this manifest instead of searching for one |
-| `launcher.exe ... -- <args>` | Extra arguments for the game |
+| A tool is reported **MISSING** after installing it | Close the launcher and start it again. If the check still fails, restart Windows (common after Visual Studio). For Visual Studio, make sure the *Desktop development with C++* workload is installed: open the *Visual Studio Installer*, choose *Modify*. |
+| winget is not offered | It is part of *App Installer* from the Microsoft Store. Update or install that, or install the tools by hand using the links in the log. |
+| "is not the version this recompilation was made for" | Your disc is a different release. Check the version listed in the game's README. |
+| "does not look like the extracted disc" | The folder you chose is not the top of the disc. Pick the folder that directly contains `default.xbe` / `default.xex`. |
+| "is not an Xbox disc image" | The file is not a disc image the launcher understands, or it is damaged or incomplete. Dump the disc again. |
+| A setup step **failed** | Its output is in the window and in `setup.log`. The last lines usually say why (often a missing tool or a full disk). Fix that and press **Run setup** again. If you report a problem, attach `setup.log`. |
+| Play says the game is not set up | Setup has not finished yet, or a file it needs was removed (for example the linked disc folder was moved). Go back to the Setup page and run setup again. |
+| The game exits right away or misbehaves | Press **Open log** and see the game's README ("Debugging"). |
 
-`--play` opens the window on the Setup page instead when the game is not set up yet.
+## Files in the game folder
 
-Without `--manifest`, the launcher looks for `launcher.ini` in its own directory, then in each parent directory,
-so the same exe works from the build directory or the repository root.
+| File | What it is |
+|---|---|
+| `<game>_launcher.exe` | The launcher. |
+| `launcher.ini` | The game's launcher settings, part of the game. Do not edit unless you know why. |
+| `launcher.user.ini` | Your choices: options, extra arguments, the game copy you chose. Delete it to start from the defaults. |
+| `setup.log` | Everything the last setup printed. |
+| `game_files\` or `assets\` | Your extracted disc, or a link to the folder you chose. |
+| `build\` or `out\` | The compiled game. |
 
-## Manifest format (`launcher.ini`)
+To remove the game, delete its folder (and the helper SDK folder next to it, if the game made one). Tools
+installed during setup stay installed. Remove them under *Settings → Apps* if you no longer want them.
 
-A Windows INI file (ASCII). Paths are relative to the manifest's directory.
-Values may use `{root}` (the manifest's directory), `{exe_dir}` (the game executable's directory) and
-`%ENVIRONMENT%` variables.
+## Updating to a new version
 
-Comments must be on their own line: Windows INI parsing keeps a trailing `; ...` as part of the value.
+Unzip the new release into a **new** folder and set it up as above. You can choose the same disc image
+again, or the `game_files\` / `assets\` folder of the old installation as the game copy (as long as you keep
+it). Setup only skips steps whose results are already in place, so a fresh folder gets a fresh build.
 
-```ini
-[game]
-title=Midtown Madness 3
-; Optional, shown under the title.
-subtitle=Static recompilation (original Xbox)
-; Required.
-exe=build\Release\mm3_recomp.exe
-; Default {root}.
-workdir={root}
-; Always passed. Quote paths yourself.
-args=--game_data_root="{root}\assets"
-; Redirect stderr / stdout to these files (optional; they may be the same file).
-stderr_log=run.log
-stdout_log=
-; What "Open log" opens (default: stderr_log, else stdout_log).
-log=run.log
-; Default of "Show the game's console window".
-console=1
-; Where the player's choices are saved (default shown).
-user_settings=launcher.user.ini
+## From a git clone
 
-[require]
-; path=hint. Play refuses to start, showing the hint, when the path does not exist.
-game_files\default.xbe=Extract your disc into game_files\ first, see README.md.
-
-[env]
-; Environment variables that are always set.
-RECOMP_PB_EXEC=1
-
-; One section per option. The id after "setting." is the key saved in launcher.user.ini.
-[setting.res]
-; Page in the left-hand list; pages appear in order of first use.
-group=Graphics
-label=Internal resolution
-; bool | choice | int | text
-type=choice
-; Set this environment variable to the value, and/or append arg= with {value} replaced.
-env=RECOMP_D3D11_RES
-; arg=--resolution_scale={value}
-; value:label pairs separated by |. An empty value means "not set".
-choices=1:1x 640x480|2:2x 1280x960|:Off
-default=2
-help=Shown in grey under the control.
-```
-
-Types:
-
-- **bool** — a check box. `on=` / `off=` give the two values. Defaults: `1` / empty for `env=` settings
-  (empty means the variable is not set), `true` / `false` for `arg=` settings. `default=` may be `1`/`0`,
-  `true`/`false`, or one of the two values.
-- **choice** — a drop-down list from `choices=`.
-- **int** — a number box clamped to `min=` / `max=`. An empty box means `default=`, or "not set" with
-  `allow_empty=1`.
-- **text** — free text.
-
-A setting whose value is empty is left out: its `arg=` is not passed and its `env=` variable is removed from
-the environment the game inherits (so a stray global variable cannot change the result).
-
-If the "Extra arguments" box already contains a setting's argument (the text of `arg=` up to its `=`), the
-setting is not passed, since some runtimes (ReXGlue) exit when a cvar is given twice.
-
-## First-time setup (`[setup]`, `[check.*]`, `[step.*]`)
-
-A manifest with a `[setup]` section (or any `[step.*]`) gets a **Setup** page. Setup counts as needed while any
-`done_when` path is missing. In that state the window opens on the Setup page and Play sends the player there.
-
-```ini
-[setup]
-; Where the game copy goes. The player chooses either:
-;  - a disc image (.iso): extracted into game_dir. Plain XISO, or a full XGD1/XGD2/XGD3 dump.
-;  - a folder that holds the extracted disc: game_dir becomes a directory junction to it (nothing is copied).
-; Leave game_dir out when the game needs no files.
-game_dir=game_files
-; A file every good copy has, relative to game_dir.
-game_check=default.xbe
-; Optional. A mismatch warns that the copy is a different version and asks whether to go on.
-game_sha1=e63b03dd956544d3838bead8be5622da6cd189e1
-; Shown under the game copy box.
-game_label=Your Midtown Madness 3 disc
-; Shown at the top of the page.
-intro=The launcher builds the game from your own copy...
-; Paths separated by |. Default: [game] exe, every [require] path, and game_dir\game_check.
-done_when=
-; Everything setup prints, beside the manifest (default shown).
-log=setup.log
-
-; Required tools, checked first. A check passes when any exists= path exists (separated by |) or command= exits 0.
-[check.python]
-label=Python 3.10+ with capstone
-command=python -c "import capstone"
-hint=Install Python from https://www.python.org, then run: pip install capstone
-; Optional: a command that installs the tool. When checks with install= fail, the launcher offers to run
-; them (in check order), reloads PATH from the registry before each one and checks again.
-install=python -m pip install capstone
-
-; Build steps, run in order through cmd.exe with their output in the window and the log.
-[step.build]
-label=Recompile and build the game
-command=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File regen.ps1
-; Default {root}.
-workdir={root}
-; Skip the step when this path exists.
-skip_if=build\Release\mm3_recomp.exe
-; Optional. The step fails unless its output contains this text (for scripts that exit 0 on failure).
-success=BUILD_EXIT=0
-; Progress bar (all optional). Milestones: output text=percent of this step, in the order they appear.
-progress=JSON exported to=2|Translating=40|-- Configuring done=55|BUILD_EXIT=100
-; Output lines matching this wildcard pattern (* and ?, against the whole line without its outer blanks),
-; counted from the last milestone, fill the bar towards the next one. The number is how many to expect.
-progress_count=*.c|213
-; This step's share of the whole bar, relative to the other steps (default 1). Roughly minutes works well.
-weight=20
-```
-
-While setup runs, a progress bar above the log shows how far the whole setup is. Each step owns a share of the
-bar set by its `weight=`. Bringing in the game files owns `[setup] game_weight=` (default 1) and follows the
-disc extraction. Inside a step, the bar jumps to each `progress=` milestone as its text shows up in the
-output. Between milestones it is filled by the lines `progress_count=` counts, or by Ninja's `[n/m]` lines,
-which are recognised without any setting. In a stretch with nothing to count, the bar creeps towards the
-next milestone, about 90% of the way over 8 minutes, so a long quiet tool still shows movement. The bar
-never moves backwards. A step with no `progress=` milestones moves the bar only through Ninja lines and when
-it finishes.
-
-A step fails on a non-zero exit code, or when `success=` text is set and its output does not contain it.
-Setup stops at the first failure, and pressing Run setup again picks it up at the first step without a
-`skip_if` match.
-
-Commands run with `PYTHONUNBUFFERED=1`, `MSBUILDDISABLENODEREUSE=1` and `CMAKE_POLICY_VERSION_MINIMUM=3.5` (so
-CMake 4 still configures third-party code that declares an older minimum), and with the Windows folders added to
-`PATH` if the inherited `PATH` lacks them. **Cancel** kills the step and everything it started.
-
-Write the steps so that they can run more than once. The player may run setup again after a failure or after
-updating the repository.
-
-The build usually overwrites the launcher's copies with fresh builds. A copy that is running, such as the one
-that started the build, is left as it is (see `cmake/copy_launcher.cmake`).
-
-## The Launcher page
-
-Every game also gets a **Launcher** page with:
-
-- **Extra arguments** appended to the command line, and **extra environment** (`NAME=value;NAME2=value`,
-  `NAME=` removes a variable) — for debug switches that do not deserve a setting.
-- **Show the game's console window** — console-subsystem games only. When on, the launcher opens a console for
-  the game and the streams that are not redirected to the log show there; when off the game runs with no
-  console and those streams are discarded.
-- **Close the launcher when the game starts** — otherwise it stays open and shows the exit code.
-- A read-only preview of exactly what Play runs: changed environment variables, the command line, and the log
-  redirection.
-
-Choices are saved to `launcher.user.ini` beside the manifest on **Save** and on **Play**.
-
-## Building on its own
+The launcher is built with the game, so before the first build it has to be built on its own. In the clone,
+with CMake and Visual Studio installed:
 
 ```
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+git submodule update --init launcher
+cmake -S launcher -B launcher/build
+cmake --build launcher/build --config Release
 ```
 
-Works with MSVC, clang (GNU or MSVC style driver) and MinGW. On other platforms the CMake project does nothing,
-so including it from a cross-platform game is harmless.
+Run `launcher\build\Release\recomp_launcher.exe`. It finds the game's `launcher.ini` itself, and everything
+above applies. Once setup has built the game, `<game>_launcher.exe` is in the repository root. Use that one
+from then on.
