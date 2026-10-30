@@ -14,6 +14,9 @@ disc). The launcher checks that the build tools are installed, extracts the disc
 expected version, and runs the game's recompile and build steps, showing their output as they run. Play is
 available once setup has finished.
 
+**Players:** [SETUP.md](SETUP.md) explains first-time setup and the launcher, step by step. This README is for
+people adding the launcher to a recompilation. Game READMEs link to SETUP.md rather than repeating it.
+
 ## First run from a fresh clone
 
 The games' release zips already contain the launcher. Each game repo has a `release.yml` workflow that, on
