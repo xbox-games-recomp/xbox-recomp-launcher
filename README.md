@@ -175,7 +175,23 @@ workdir={root}
 skip_if=build\Release\mm3_recomp.exe
 ; Optional. The step fails unless its output contains this text (for scripts that exit 0 on failure).
 success=BUILD_EXIT=0
+; Progress bar (all optional). Milestones: output text=percent of this step, in the order they appear.
+progress=JSON exported to=2|Translating=40|-- Configuring done=55|BUILD_EXIT=100
+; Output lines matching this wildcard pattern (* and ?, against the whole line without its outer blanks),
+; counted from the last milestone, fill the bar towards the next one. The number is how many to expect.
+progress_count=*.c|213
+; This step's share of the whole bar, relative to the other steps (default 1). Roughly minutes works well.
+weight=20
 ```
+
+While setup runs, a progress bar above the log shows how far the whole setup is. Each step owns a share of the
+bar set by its `weight=`. Bringing in the game files owns `[setup] game_weight=` (default 1) and follows the
+disc extraction. Inside a step, the bar jumps to each `progress=` milestone as its text shows up in the
+output. Between milestones it is filled by the lines `progress_count=` counts, or by Ninja's `[n/m]` lines,
+which are recognised without any setting. In a stretch with nothing to count, the bar creeps towards the
+next milestone, about 90% of the way over 8 minutes, so a long quiet tool still shows movement. The bar
+never moves backwards. A step with no `progress=` milestones moves the bar only through Ninja lines and when
+it finishes.
 
 A step fails on a non-zero exit code, or when `success=` text is set and its output does not contain it.
 Setup stops at the first failure, and pressing Run setup again picks it up at the first step without a

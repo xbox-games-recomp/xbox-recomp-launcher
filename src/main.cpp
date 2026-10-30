@@ -196,11 +196,18 @@ struct Check {
 
 struct Step {
   wstring label, command, workdir, skip_if, success;
+  // Progress bar: output text -> share of the step done (0..1), in order; a wildcard pattern for
+  // whole lines counted towards the next milestone; this step's share of the whole bar.
+  std::vector<std::pair<wstring, double>> milestones;
+  wstring count_text;
+  int count_expected = 0;
+  double weight = 1;
 };
 
 struct Setup {
   bool present = false;
   wstring intro, game_dir, game_check, game_sha1, game_label, log;
+  double game_weight = 1;  // share of the progress bar for bringing in the game files
   std::vector<wstring> done_when;  // setup is needed while any of these is missing
   std::vector<Check> checks;
   std::vector<Step> steps;
@@ -325,6 +332,18 @@ bool load_manifest(Game& g, const wstring& path, wstring& err) {
       st.workdir = ini_get(m, sec, L"workdir", L"{root}");
       st.skip_if = ini_get(m, sec, L"skip_if");
       st.success = ini_get(m, sec, L"success");
+      for (auto& item : split(ini_get(m, sec, L"progress"), L'|')) {
+        size_t eq = item.rfind(L'=');
+        if (eq == wstring::npos || trim(item.substr(0, eq)).empty()) continue;
+        double pct = std::clamp(_wtof(item.c_str() + eq + 1), 0.0, 100.0);
+        st.milestones.emplace_back(trim(item.substr(0, eq)), pct / 100);
+      }
+      auto count = split(ini_get(m, sec, L"progress_count"), L'|');
+      if (count.size() == 2 && !trim(count[0]).empty()) {
+        st.count_text = trim(count[0]);
+        st.count_expected = std::max(1, _wtoi(count[1].c_str()));
+      }
+      st.weight = std::max(0.0, _wtof(ini_get(m, sec, L"weight", L"1").c_str()));
       if (st.command.empty()) {
         err = L"[" + sec + L"] needs command=";
         return false;
@@ -340,6 +359,7 @@ bool load_manifest(Game& g, const wstring& path, wstring& err) {
     su.game_sha1 = lower(ini_get(m, L"setup", L"game_sha1"));
     su.game_label = ini_get(m, L"setup", L"game_label", L"Your copy of the game");
     su.log = ini_get(m, L"setup", L"log", L"setup.log");
+    su.game_weight = std::max(0.0, _wtof(ini_get(m, L"setup", L"game_weight", L"1").c_str()));
     wstring done = ini_get(m, L"setup", L"done_when");
     if (!done.empty()) {
       for (auto& p : split(done, L'|'))
@@ -579,6 +599,7 @@ enum : int {
   IDC_SETUP_RUN,
   IDC_SETUP_CANCEL,
   IDC_SETUP_LOG,
+  IDC_SETUP_BAR,
   IDC_SETTING0 = 1000,
 };
 constexpr UINT WM_GAME_EXITED = WM_APP + 1;
@@ -588,6 +609,7 @@ constexpr UINT WM_SETUP_PROGRESS = WM_APP + 3;
 constexpr UINT WM_SETUP_STATE = WM_APP + 4;  // wp = item, lp = ItemState
 constexpr UINT WM_SETUP_ASK = WM_APP + 5;    // lp = const wstring* question; returns IDYES / IDNO
 constexpr UINT WM_SETUP_DONE = WM_APP + 6;   // wp = success
+constexpr UINT WM_SETUP_PERCENT = WM_APP + 7;  // wp = whole setup done, in 1/1000
 
 enum ItemState : int { Pending, Running, Done, Skipped, Failed };
 
@@ -606,7 +628,7 @@ struct App {
   HWND play = nullptr, quit = nullptr, save = nullptr, reset = nullptr, log = nullptr, folder = nullptr;
   HWND extra_args = nullptr, extra_env = nullptr, show_console = nullptr, close_on_launch = nullptr;
   HWND setup_source = nullptr, setup_source_help = nullptr, setup_steps = nullptr, setup_log = nullptr;
-  HWND setup_run = nullptr, setup_cancel_btn = nullptr;
+  HWND setup_run = nullptr, setup_cancel_btn = nullptr, setup_bar = nullptr;
   std::vector<Row> rows;
   std::vector<wstring> nav_items;
   int group_base = 0;  // nav index of the first settings group (1 when there is a Setup page)
@@ -621,6 +643,10 @@ struct App {
   std::atomic<bool> setup_cancel{false};
   std::vector<wstring> setup_items;
   std::vector<int> setup_states;
+  bool setup_active = false;  // the progress bar is shown while setup runs
+  // Progress, in units of item weight (setup thread only).
+  double prog_total = 0, prog_done = 0, prog_weight = 0;
+  int prog_last = -1;
 } app;
 
 int S(int v) { return MulDiv(v, (int)app.dpi, 96); }
@@ -793,7 +819,12 @@ void layout() {
       wstring t = window_text(r.help);
       h += t.empty() ? 0 : text_height(app.wnd, app.small_font, t, cw) + S(2);
     }
+    if (r.ctl && r.ctl == app.setup_bar && !app.setup_active) {
+      MoveWindow(r.ctl, cx, top + y, cw, 0, FALSE);
+      continue;
+    }
     int ch = r.height ? S(r.height) : r.ctl == app.cmdline ? S(96) : r.ctl == app.extra_env ? S(48) : rowh;
+    if (r.ctl && r.ctl == app.setup_log && app.setup_active) ch -= rowh + gap;  // the bar row above it
     if (r.wrap && r.ctl) ch = std::max(rowh - S(4), text_height(app.wnd, app.font, window_text(r.ctl), cw));
     if (!r.buttons.empty()) ch = std::max(ch, rowh + S(2));
     if (r.label) MoveWindow(r.label, x0, top + y + (r.wrap ? 0 : S(4)), label_w, rowh, FALSE);
@@ -829,7 +860,7 @@ void layout() {
   if (rc.right != W || rc.bottom != H)
     SetWindowPos(app.wnd, nullptr, 0, 0, want.right - want.left, want.bottom - want.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-  InvalidateRect(app.wnd, nullptr, TRUE);
+  RedrawWindow(app.wnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);  // children moved without repainting
 }
 
 void show_page(int page) {
@@ -837,7 +868,7 @@ void show_page(int page) {
   for (auto& r : app.rows) {
     int show = r.group == page ? SW_SHOW : SW_HIDE;
     for (HWND h : {r.label, r.ctl, r.help})
-      if (h) ShowWindow(h, show);
+      if (h) ShowWindow(h, h == app.setup_bar && !app.setup_active ? SW_HIDE : show);
     for (HWND h : r.buttons) ShowWindow(h, show);
   }
   SendMessageW(app.nav, LB_SETCURSEL, page, 0);
@@ -901,6 +932,98 @@ wstring gb(uint64_t bytes) {
   return b;
 }
 
+// Moves the bar to the current item's fraction f (0..1).
+void sfraction(double f) {
+  if (app.prog_total <= 0) return;
+  double done = app.prog_done + app.prog_weight * std::clamp(f, 0.0, 1.0);
+  int pm = (int)(done / app.prog_total * 1000);
+  if (pm == app.prog_last) return;
+  app.prog_last = pm;
+  PostMessageW(app.wnd, WM_SETUP_PERCENT, pm, 0);
+}
+
+void sitem_begin(double weight) {
+  app.prog_weight = weight;
+  sfraction(0);
+}
+
+void sitem_end() {
+  app.prog_done += app.prog_weight;
+  app.prog_weight = 0;
+  sfraction(0);
+}
+
+// How far a step is, from its output: the last milestone seen, plus the counted lines (or a Ninja
+// "[n/m]" counter) filling the stretch up to the next milestone. Never goes back.
+// Wildcard match of a whole string: * any run of characters, ? one character.
+bool glob_match(const wchar_t* p, const wchar_t* s) {
+  const wchar_t *star = nullptr, *resume = nullptr;
+  while (*s) {
+    if (*p == L'*') {
+      star = p++;
+      resume = s;
+    } else if (*p == L'?' || *p == *s) {
+      ++p;
+      ++s;
+    } else if (star) {
+      p = star + 1;
+      s = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while (*p == L'*') ++p;
+  return !*p;
+}
+
+// A stretch with nothing to count (a long quiet tool) creeps towards the next milestone instead of
+// standing still: 0.5% of what is left per second, about 90% of the stretch in 8 minutes.
+struct StepProgress {
+  const Step* step = nullptr;
+  size_t next = 0;  // first milestone not seen yet
+  double base = 0, cur = 0;
+  int counted = 0;
+  bool counter_seen = false;  // counted or [n/m] lines in this stretch
+  DWORD last_tick = GetTickCount();
+
+  double hi() const {
+    return next < step->milestones.size() ? std::max(base, step->milestones[next].second) : 1.0;
+  }
+
+  void tick() {
+    DWORD now = GetTickCount();
+    if (now - last_tick < 1000) return;
+    last_tick = now;
+    if (step->milestones.empty() || counter_seen) return;
+    cur += (hi() - cur) * 0.005;
+    sfraction(cur);
+  }
+
+  void feed(const wstring& line) {
+    for (size_t i = next; i < step->milestones.size(); ++i) {
+      if (line.find(step->milestones[i].first) == wstring::npos) continue;
+      base = std::max(base, step->milestones[i].second);
+      next = i + 1;
+      counted = 0;
+      counter_seen = false;
+      break;
+    }
+    double hi = this->hi();
+    double sub = -1;
+    if (!step->count_text.empty() && glob_match(step->count_text.c_str(), trim(line).c_str())) {
+      sub = std::min(1.0, ++counted / (double)step->count_expected);
+    } else {
+      unsigned n = 0, m = 0;
+      wchar_t close = 0;
+      if (swscanf(line.c_str(), L"[%u/%u%lc", &n, &m, &close) == 3 && close == L']' && m) sub = std::min(1.0, n / (double)m);
+    }
+    if (sub >= 0) counter_seen = true;
+    cur = std::max({cur, base, sub >= 0 ? base + (hi - base) * sub : 0.0});
+    sfraction(cur);
+  }
+};
+StepProgress* g_step_progress = nullptr;  // the step whose output run_command is reading
+
 // Runs a command line through cmd.exe in the setup job, sending its output to the setup log (or, when quiet,
 // only to *captured*). Returns the exit code, or -1 when it could not start or setup was cancelled.
 long run_command(const wstring& command, const wstring& workdir, const wstring& success = L"",
@@ -955,6 +1078,7 @@ long run_command(const wstring& command, const wstring& workdir, const wstring& 
   auto emit = [&](const std::string& raw) {
     wstring line = decode(raw);
     if (!success.empty() && success_seen && line.find(success) != wstring::npos) *success_seen = true;
+    if (g_step_progress && !quiet) g_step_progress->feed(line);
     if (quiet) {
       if (captured) *captured += line + L"\r\n";
     } else {
@@ -986,6 +1110,7 @@ long run_command(const wstring& command, const wstring& workdir, const wstring& 
       drain(false);
       continue;
     }
+    if (g_step_progress && !quiet) g_step_progress->tick();
     if (!alive || WaitForSingleObject(pi.hProcess, 50) == WAIT_OBJECT_0) {
       // Exited: take whatever is still in the pipe.
       while (PeekNamedPipe(rd, nullptr, 0, nullptr, &avail, nullptr) && avail &&
@@ -1137,6 +1262,7 @@ bool extract_iso(const wstring& iso, const wstring& target, wstring& err) {
         int pct = total ? (int)(done * 100 / total) : 100;
         if (pct != last_pct) {
           last_pct = pct;
+          sfraction(pct / 100.0);
           sprogress(L"Extracting the disc image: " + std::to_wstring(pct) + L"% (" + gb(done) + L" of " + gb(total) +
                     L")");
         }
@@ -1284,6 +1410,10 @@ DWORD WINAPI setup_thread(void* p) {
   const Setup& su = g.setup;
   wstring err;
   bool ok = true;
+  app.prog_total = su.game_dir.empty() ? 0 : su.game_weight;
+  for (auto& st : su.steps) app.prog_total += st.weight;
+  app.prog_done = app.prog_weight = 0;
+  app.prog_last = -1;
 
   // 0: tools
   sstate(0, Running);
@@ -1314,7 +1444,9 @@ DWORD WINAPI setup_thread(void* p) {
     } else {
       sstate(1, Running);
       sprogress(L"Bringing in the game files");
+      sitem_begin(su.game_weight);
       ok = setup_game_files(g, *source, err);
+      sitem_end();
       sstate(1, ok ? Done : Failed);
     }
   }
@@ -1327,6 +1459,8 @@ DWORD WINAPI setup_thread(void* p) {
       slog(L"");
       slog(L"== " + st.label + L": already done (" + st.skip_if + L" exists)");
       sstate(item, Skipped);
+      sitem_begin(st.weight);
+      sitem_end();
       continue;
     }
     sstate(item, Running);
@@ -1337,7 +1471,12 @@ DWORD WINAPI setup_thread(void* p) {
     slog(L"> " + cmd);
     bool seen = false;
     DWORD t0 = GetTickCount();
+    StepProgress sp;
+    sp.step = &st;
+    sitem_begin(st.weight);
+    g_step_progress = &sp;
     long code = run_command(cmd, join(g.root, substitute(g, st.workdir)), st.success, &seen);
+    g_step_progress = nullptr;
     wchar_t took[64];
     swprintf(took, 64, L" (exit code %ld, %lu min %lu s)", code, (GetTickCount() - t0) / 60000,
              (GetTickCount() - t0) / 1000 % 60);
@@ -1347,6 +1486,7 @@ DWORD WINAPI setup_thread(void* p) {
       if (code == 0) err += L" Its output did not contain \"" + st.success + L"\".";
     } else {
       slog(L"== " + st.label + L": done" + took);
+      sitem_end();
     }
     sstate(item, ok ? Done : Failed);
   }
@@ -1404,6 +1544,10 @@ void append_setup_log(const wstring& text) {
 }
 
 void set_setup_running(bool on) {
+  app.setup_active = on;
+  SendMessageW(app.setup_bar, PBM_SETPOS, 0, 0);
+  ShowWindow(app.setup_bar, on && app.page == 0 ? SW_SHOW : SW_HIDE);
+  layout();
   EnableWindow(app.setup_run, !on);
   EnableWindow(app.setup_cancel_btn, on);
   EnableWindow(app.play, !on && !app.running);
@@ -1533,6 +1677,10 @@ void create_controls() {
     app.setup_log = child(WC_EDITW, L"", WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_SETUP_LOG,
                           WS_EX_CLIENTEDGE);
     SendMessageW(app.setup_log, EM_SETLIMITTEXT, 0x7FFFFFFE, 0);
+    // Shown only while setup runs; layout() takes its room from the log, so the window keeps its size.
+    app.setup_bar = child(PROGRESS_CLASSW, L"", 0, IDC_SETUP_BAR);
+    SendMessageW(app.setup_bar, PBM_SETRANGE32, 0, 1000);
+    app.rows.push_back({0, nullptr, app.setup_bar, nullptr, {}, 16});
     app.rows.push_back({0, nullptr, app.setup_log, nullptr, {}, 170});
     app.setup_run = child(WC_BUTTONW, L"Run setup", WS_TABSTOP, IDC_SETUP_RUN);
     app.setup_cancel_btn = child(WC_BUTTONW, L"Cancel", WS_TABSTOP | WS_DISABLED, IDC_SETUP_CANCEL);
@@ -1750,6 +1898,9 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
       set_status(*s);
       return 0;
     }
+    case WM_SETUP_PERCENT:
+      SendMessageW(app.setup_bar, PBM_SETPOS, wp, 0);
+      return 0;
     case WM_SETUP_STATE:
       if (wp < app.setup_states.size()) app.setup_states[wp] = (int)lp;
       update_setup_steps();
@@ -1851,7 +2002,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   }
 
   CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);  // file dialogs
-  INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES};
+  INITCOMMONCONTROLSEX icc{sizeof icc, ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS};
   InitCommonControlsEx(&icc);
 
   // The game's own icon, when it has one.
