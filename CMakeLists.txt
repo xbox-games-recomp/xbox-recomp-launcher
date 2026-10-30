@@ -1,4 +1,4 @@
-# recomp-launcher: settings window and launcher for statically recompiled Xbox / Xbox 360 games.
+# xbox-recomp-launcher: settings window and launcher for statically recompiled Xbox / Xbox 360 games.
 #
 # Standalone:   cmake -B build && cmake --build build --config Release
 # In a game:    add_subdirectory(launcher)
@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.21)
 project(recomp_launcher LANGUAGES CXX)
 
 if(NOT WIN32)
-  message(STATUS "recomp-launcher: Windows only, skipped")
+  message(STATUS "xbox-recomp-launcher: Windows only, skipped")
   function(recomp_add_launcher)
   endfunction()
   return()

@@ -1,4 +1,4 @@
-# recomp-launcher: first-time setup and playing
+# xbox-recomp-launcher: first-time setup and playing
 
 The launcher for statically recompiled Xbox and Xbox 360 games. It sets the game up from your own disc,
 then starts it with the options you choose.

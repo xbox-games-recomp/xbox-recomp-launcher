@@ -1,4 +1,4 @@
-// recomp-launcher: settings window and launcher for statically recompiled Xbox / Xbox 360 games.
+// xbox-recomp-launcher: settings window and launcher for statically recompiled Xbox / Xbox 360 games.
 //
 // Everything game specific lives in a manifest, launcher.ini, next to the launcher or in one of its
 // parent directories (see DEVELOPERS.md). The user's choices are saved to launcher.user.ini beside it.

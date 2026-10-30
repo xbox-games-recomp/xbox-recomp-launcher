@@ -1,4 +1,4 @@
-# recomp-launcher: developer guide
+# xbox-recomp-launcher: developer guide
 
 For people adding the launcher to a recompilation. Players want [README.md](README.md).
 
@@ -28,7 +28,7 @@ In a clone, the launcher is normally built together with the game. Before the fi
 ways:
 
 - Download `recomp_launcher.exe` from this repository's
-  [releases](https://github.com/taxidriverhk/recomp-launcher/releases) into the game's repository root.
+  [releases](https://github.com/taxidriverhk/xbox-recomp-launcher/releases) into the game's repository root.
 - Or build it from the game's `launcher` submodule, which takes a few seconds:
 
   ```
@@ -46,7 +46,7 @@ after the game (e.g. `mm3_launcher.exe`) in the repository root, and from then o
 Add this repository as a submodule and hook it into the game's CMake build:
 
 ```
-git submodule add https://github.com/taxidriverhk/recomp-launcher.git launcher
+git submodule add https://github.com/taxidriverhk/xbox-recomp-launcher.git launcher
 ```
 
 ```cmake
